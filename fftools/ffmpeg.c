@@ -2413,7 +2413,7 @@ static void *filter_pipeline(void *arg)
         if (ret < 0)
             break;
     }
-    return;
+    return NULL;
 }
 #endif
 static int send_frame_to_filters(InputStream *ist, AVFrame *decoded_frame)

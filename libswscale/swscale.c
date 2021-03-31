@@ -22,6 +22,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <pthread.h>
 
 #include "libavutil/avassert.h"
 #include "libavutil/avutil.h"
@@ -234,6 +235,31 @@ static void lumRangeFromJpeg16_c(int16_t *_dst, int width)
 #define DEBUG_BUFFERS(...)                      \
     if (DEBUG_SWSCALE_BUFFERS)                  \
         av_log(c, AV_LOG_DEBUG, __VA_ARGS__)
+
+#if HAVE_THREADS
+//static int swscale_threads_prepare(SwsContext *c)
+//{
+//    int i;
+//
+//    if (c->is_threads_prepared) {
+//        return 0;
+//    }
+//    c->is_threads_prepared = 1;
+//
+//    if (!c->threads_ctx) return 0;
+//
+//    for (i = 0; i < c->sw_nbthreads ; ++i) {
+//        struct SwsContextThread *ctx = &c->threads_ctx[i];
+//
+//        memcpy(ctx->func_ctx, c ,sizeof(SwsContext));
+//        ctx->func_ctx->parent = c;
+//        ff_init_filters(ctx->func_ctx);
+//        ctx->func_pfn = swscale_step;
+//    }
+//
+//    return 0;
+//}
+#endif
 
 static int swscale(SwsContext *c, const uint8_t *src[],
                    int srcStride[], int srcSliceY,

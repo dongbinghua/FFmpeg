@@ -22,6 +22,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <pthread.h>
 
 #include "libavutil/avassert.h"
 #include "libavutil/avutil.h"
@@ -235,6 +236,211 @@ static void lumRangeFromJpeg16_c(int16_t *_dst, int width)
     if (DEBUG_SWSCALE_BUFFERS)                  \
         av_log(c, AV_LOG_DEBUG, __VA_ARGS__)
 
+
+static void swscale_step(SwsContext *c)
+{
+    SwsContextStep *step = &c->step_param;
+    int dstY= step->dstY;
+    int dstHend= step->dstHend;
+    int dstH= step->dstH;
+    int srcSliceY= step->srcSliceY;
+    int srcSliceH= step->srcSliceH;
+
+    const int32_t *vLumFilterPos           = c->vLumFilterPos;
+    const int32_t *vChrFilterPos           = c->vChrFilterPos;
+
+    const int vLumFilterSize         = c->vLumFilterSize;
+    const int vChrFilterSize         = c->vChrFilterSize;
+
+    const int chrSrcSliceY           =                srcSliceY >> c->chrSrcVSubSample;
+    const int chrSrcSliceH           = AV_CEIL_RSHIFT(srcSliceH,   c->chrSrcVSubSample);
+    const int should_dither          = isNBPS(c->srcFormat) ||
+                                       is16BPS(c->srcFormat);
+
+    /* vars which will change and which we need to store back in the context */
+    int lastInLumBuf = c->lastInLumBuf;
+    int lastInChrBuf = c->lastInChrBuf;
+
+    const int lumStart = 0;
+    const int lumEnd = c->descIndex[0];
+    const int chrStart = lumEnd;
+    const int chrEnd = c->descIndex[1];
+    const int vStart = chrEnd;
+    const int vEnd = c->numDesc;
+    SwsSlice *hout_slice = &c->slice[c->numSlice-2];
+    SwsFilterDescriptor *desc = c->desc;
+
+    int hasLumHoles = 1;
+    int hasChrHoles = 1;
+
+    int refreshBuff = 1;
+
+    for (; dstY < dstHend; dstY++) {
+        const int chrDstY = dstY >> c->chrDstVSubSample;
+        int use_mmx_vfilter= c->use_mmx_vfilter;
+
+        // First line needed as input
+        const int firstLumSrcY  = FFMAX(1 - vLumFilterSize, vLumFilterPos[dstY]);
+        const int firstLumSrcY2 = FFMAX(1 - vLumFilterSize, vLumFilterPos[FFMIN(dstY | ((1 << c->chrDstVSubSample) - 1), dstH - 1)]);
+        // First line needed as input
+        const int firstChrSrcY  = FFMAX(1 - vChrFilterSize, vChrFilterPos[chrDstY]);
+
+        // Last line needed as input
+        int lastLumSrcY  = FFMIN(c->srcH,    firstLumSrcY  + vLumFilterSize) - 1;
+        int lastLumSrcY2 = FFMIN(c->srcH,    firstLumSrcY2 + vLumFilterSize) - 1;
+        int lastChrSrcY  = FFMIN(c->chrSrcH, firstChrSrcY  + vChrFilterSize) - 1;
+        int enough_lines;
+
+        int i;
+        int posY, cPosY, firstPosY, lastPosY, firstCPosY, lastCPosY;
+
+        // handle holes (FAST_BILINEAR & weird filters)
+        if (refreshBuff || firstLumSrcY > lastInLumBuf) {
+
+            hasLumHoles = lastInLumBuf != firstLumSrcY - 1;
+            if (hasLumHoles) {
+                hout_slice->plane[0].sliceY = firstLumSrcY;
+                hout_slice->plane[3].sliceY = firstLumSrcY;
+                hout_slice->plane[0].sliceH =
+                hout_slice->plane[3].sliceH = 0;
+            }
+
+            lastInLumBuf = firstLumSrcY - 1;
+        }
+        if (refreshBuff || firstChrSrcY > lastInChrBuf) {
+
+            hasChrHoles = lastInChrBuf != firstChrSrcY - 1;
+            if (hasChrHoles) {
+                hout_slice->plane[1].sliceY = firstChrSrcY;
+                hout_slice->plane[2].sliceY = firstChrSrcY;
+                hout_slice->plane[1].sliceH =
+                hout_slice->plane[2].sliceH = 0;
+            }
+
+            lastInChrBuf = firstChrSrcY - 1;
+        }
+
+        refreshBuff = 0;
+
+        DEBUG_BUFFERS("dstY: %d\n", dstY);
+        DEBUG_BUFFERS("\tfirstLumSrcY: %d lastLumSrcY: %d lastInLumBuf: %d\n",
+                      firstLumSrcY, lastLumSrcY, lastInLumBuf);
+        DEBUG_BUFFERS("\tfirstChrSrcY: %d lastChrSrcY: %d lastInChrBuf: %d\n",
+                      firstChrSrcY, lastChrSrcY, lastInChrBuf);
+
+        // Do we have enough lines in this slice to output the dstY line
+        enough_lines = lastLumSrcY2 < srcSliceY + srcSliceH &&
+                       lastChrSrcY < AV_CEIL_RSHIFT(srcSliceY + srcSliceH, c->chrSrcVSubSample);
+
+        if (!enough_lines) {
+            lastLumSrcY = srcSliceY + srcSliceH - 1;
+            lastChrSrcY = chrSrcSliceY + chrSrcSliceH - 1;
+            DEBUG_BUFFERS("buffering slice: lastLumSrcY %d lastChrSrcY %d\n",
+                          lastLumSrcY, lastChrSrcY);
+        }
+
+        av_assert0((lastLumSrcY - firstLumSrcY + 1) <= hout_slice->plane[0].available_lines);
+        av_assert0((lastChrSrcY - firstChrSrcY + 1) <= hout_slice->plane[1].available_lines);
+
+
+        posY = hout_slice->plane[0].sliceY + hout_slice->plane[0].sliceH;
+        if (posY <= lastLumSrcY && !hasLumHoles) {
+            firstPosY = FFMAX(firstLumSrcY, posY);
+            lastPosY = FFMIN(firstLumSrcY + hout_slice->plane[0].available_lines - 1, srcSliceY + srcSliceH - 1);
+        } else {
+            firstPosY = posY;
+            lastPosY = lastLumSrcY;
+        }
+
+        cPosY = hout_slice->plane[1].sliceY + hout_slice->plane[1].sliceH;
+        if (cPosY <= lastChrSrcY && !hasChrHoles) {
+            firstCPosY = FFMAX(firstChrSrcY, cPosY);
+            lastCPosY = FFMIN(firstChrSrcY + hout_slice->plane[1].available_lines - 1, AV_CEIL_RSHIFT(srcSliceY + srcSliceH, c->chrSrcVSubSample) - 1);
+        } else {
+            firstCPosY = cPosY;
+            lastCPosY = lastChrSrcY;
+        }
+
+        ff_rotate_slice(hout_slice, lastPosY, lastCPosY);
+
+        if (posY < lastLumSrcY + 1) {
+            for (i = lumStart; i < lumEnd; ++i)
+                desc[i].process(c, &desc[i], firstPosY, lastPosY - firstPosY + 1);
+        }
+
+        lastInLumBuf = lastLumSrcY;
+
+        if (cPosY < lastChrSrcY + 1) {
+            for (i = chrStart; i < chrEnd; ++i)
+                desc[i].process(c, &desc[i], firstCPosY, lastCPosY - firstCPosY + 1);
+        }
+
+        lastInChrBuf = lastChrSrcY;
+
+        if (!enough_lines)
+            break;  // we can't output a dstY line so let's try with the next slice
+
+#if HAVE_MMX_INLINE
+        ff_updateMMXDitherTables(c, dstY);
+#endif
+        if (should_dither) {
+            c->chrDither8 = ff_dither_8x8_128[chrDstY & 7];
+            c->lumDither8 = ff_dither_8x8_128[dstY    & 7];
+        }
+        if (dstY >= dstH - 2) {
+            /* hmm looks like we can't use MMX here without overwriting
+             * this array's tail */
+            yuv2planar1_fn yuv2plane1            = c->yuv2plane1;
+            yuv2planarX_fn yuv2planeX            = c->yuv2planeX;
+            yuv2interleavedX_fn yuv2nv12cX   = c->yuv2nv12cX;
+            yuv2packed1_fn yuv2packed1        = c->yuv2packed1;
+            yuv2packed2_fn yuv2packed2        = c->yuv2packed2;
+            yuv2packedX_fn yuv2packedX        = c->yuv2packedX;
+            yuv2anyX_fn yuv2anyX                   = c->yuv2anyX;
+            ff_sws_init_output_funcs(c, &yuv2plane1, &yuv2planeX, &yuv2nv12cX,
+                                     &yuv2packed1, &yuv2packed2, &yuv2packedX, &yuv2anyX);
+            use_mmx_vfilter= 0;
+            ff_init_vscale_pfn(c, yuv2plane1, yuv2planeX, yuv2nv12cX,
+                           yuv2packed1, yuv2packed2, yuv2packedX, yuv2anyX, use_mmx_vfilter);
+        }
+
+        {
+            for (i = vStart; i < vEnd; ++i)
+                desc[i].process(c, &desc[i], dstY, 1);
+        }
+    }
+
+    /* store changed local vars back in the context */
+    c->dstY         = dstY;
+    c->lastInLumBuf = lastInLumBuf;
+    c->lastInChrBuf = lastInChrBuf;
+}
+
+#if HAVE_THREADS
+static int swscale_threads_prepare(SwsContext *c)
+{
+    int i;
+
+    if (c->is_threads_prepared) {
+        return 0;
+    }
+    c->is_threads_prepared = 1;
+
+    if (!c->threads_ctx) return 0;
+
+    for (i = 0; i < c->sw_nbthreads ; ++i) {
+        struct SwsContextThread *ctx = &c->threads_ctx[i];
+
+        memcpy(ctx->func_ctx, c ,sizeof(SwsContext));
+        ctx->func_ctx->parent = c;
+        ff_init_filters(ctx->func_ctx);
+        ctx->func_pfn = swscale_step;
+    }
+
+    return 0;
+}
+#endif
+
 static int swscale(SwsContext *c, const uint8_t *src[],
                    int srcStride[], int srcSliceY,
                    int srcSliceH, uint8_t *dst[], int dstStride[])
@@ -246,8 +452,6 @@ static int swscale(SwsContext *c, const uint8_t *src[],
 
     const enum AVPixelFormat dstFormat = c->dstFormat;
     const int flags                  = c->flags;
-    int32_t *vLumFilterPos           = c->vLumFilterPos;
-    int32_t *vChrFilterPos           = c->vChrFilterPos;
 
     const int vLumFilterSize         = c->vLumFilterSize;
     const int vChrFilterSize         = c->vChrFilterSize;
@@ -271,20 +475,20 @@ static int swscale(SwsContext *c, const uint8_t *src[],
     int lastInChrBuf = c->lastInChrBuf;
 
     int lumStart = 0;
-    int lumEnd = c->descIndex[0];
-    int chrStart = lumEnd;
-    int chrEnd = c->descIndex[1];
-    int vStart = chrEnd;
-    int vEnd = c->numDesc;
     SwsSlice *src_slice = &c->slice[lumStart];
     SwsSlice *hout_slice = &c->slice[c->numSlice-2];
     SwsSlice *vout_slice = &c->slice[c->numSlice-1];
-    SwsFilterDescriptor *desc = c->desc;
 
     int needAlpha = c->needAlpha;
+    SwsContextStep *step;
+    int last_chunk;
 
-    int hasLumHoles = 1;
-    int hasChrHoles = 1;
+#if HAVE_THREADS
+    int nbthreads = c->sw_nbthreads;
+    int left_lines;
+    int lines_per_thread = 0;
+    struct SwsContextThread *ctx;
+#endif
 
     if (isPacked(c->srcFormat)) {
         src[1] =
@@ -367,131 +571,82 @@ static int swscale(SwsContext *c, const uint8_t *src[],
         hout_slice->width = dstW;
     }
 
-    for (; dstY < dstH; dstY++) {
-        const int chrDstY = dstY >> c->chrDstVSubSample;
-        int use_mmx_vfilter= c->use_mmx_vfilter;
+    last_chunk = dstH - dstY;
 
-        // First line needed as input
-        const int firstLumSrcY  = FFMAX(1 - vLumFilterSize, vLumFilterPos[dstY]);
-        const int firstLumSrcY2 = FFMAX(1 - vLumFilterSize, vLumFilterPos[FFMIN(dstY | ((1 << c->chrDstVSubSample) - 1), dstH - 1)]);
-        // First line needed as input
-        const int firstChrSrcY  = FFMAX(1 - vChrFilterSize, vChrFilterPos[chrDstY]);
+#if HAVE_THREADS
+    left_lines = last_chunk;
 
-        // Last line needed as input
-        int lastLumSrcY  = FFMIN(c->srcH,    firstLumSrcY  + vLumFilterSize) - 1;
-        int lastLumSrcY2 = FFMIN(c->srcH,    firstLumSrcY2 + vLumFilterSize) - 1;
-        int lastChrSrcY  = FFMIN(c->chrSrcH, firstChrSrcY  + vChrFilterSize) - 1;
-        int enough_lines;
+    if (nbthreads > 1 && c->threads_ctx) {
+        int slice_round = 64;
 
-        int i;
-        int posY, cPosY, firstPosY, lastPosY, firstCPosY, lastCPosY;
+        /* Calculate two last lines at the end of threads. */
+        last_chunk = 2;
+        left_lines = left_lines - last_chunk;
+        lines_per_thread = (left_lines + nbthreads -1)/nbthreads;
 
-        // handle holes (FAST_BILINEAR & weird filters)
-        if (firstLumSrcY > lastInLumBuf) {
+        if (lines_per_thread < slice_round)
+            lines_per_thread = slice_round;
+        else if (lines_per_thread & (slice_round - 1))
+            lines_per_thread += slice_round - (lines_per_thread & (slice_round - 1));
 
-            hasLumHoles = lastInLumBuf != firstLumSrcY - 1;
-            if (hasLumHoles) {
-                hout_slice->plane[0].sliceY = firstLumSrcY;
-                hout_slice->plane[3].sliceY = firstLumSrcY;
-                hout_slice->plane[0].sliceH =
-                hout_slice->plane[3].sliceH = 0;
-            }
+        if (lines_per_thread > left_lines)
+            lines_per_thread =  left_lines;
 
-            lastInLumBuf = firstLumSrcY - 1;
-        }
-        if (firstChrSrcY > lastInChrBuf) {
-
-            hasChrHoles = lastInChrBuf != firstChrSrcY - 1;
-            if (hasChrHoles) {
-                hout_slice->plane[1].sliceY = firstChrSrcY;
-                hout_slice->plane[2].sliceY = firstChrSrcY;
-                hout_slice->plane[1].sliceH =
-                hout_slice->plane[2].sliceH = 0;
-            }
-
-            lastInChrBuf = firstChrSrcY - 1;
-        }
-
-        DEBUG_BUFFERS("dstY: %d\n", dstY);
-        DEBUG_BUFFERS("\tfirstLumSrcY: %d lastLumSrcY: %d lastInLumBuf: %d\n",
-                      firstLumSrcY, lastLumSrcY, lastInLumBuf);
-        DEBUG_BUFFERS("\tfirstChrSrcY: %d lastChrSrcY: %d lastInChrBuf: %d\n",
-                      firstChrSrcY, lastChrSrcY, lastInChrBuf);
-
-        // Do we have enough lines in this slice to output the dstY line
-        enough_lines = lastLumSrcY2 < srcSliceY + srcSliceH &&
-                       lastChrSrcY < AV_CEIL_RSHIFT(srcSliceY + srcSliceH, c->chrSrcVSubSample);
-
-        if (!enough_lines) {
-            lastLumSrcY = srcSliceY + srcSliceH - 1;
-            lastChrSrcY = chrSrcSliceY + chrSrcSliceH - 1;
-            DEBUG_BUFFERS("buffering slice: lastLumSrcY %d lastChrSrcY %d\n",
-                          lastLumSrcY, lastChrSrcY);
-        }
-
-        av_assert0((lastLumSrcY - firstLumSrcY + 1) <= hout_slice->plane[0].available_lines);
-        av_assert0((lastChrSrcY - firstChrSrcY + 1) <= hout_slice->plane[1].available_lines);
-
-
-        posY = hout_slice->plane[0].sliceY + hout_slice->plane[0].sliceH;
-        if (posY <= lastLumSrcY && !hasLumHoles) {
-            firstPosY = FFMAX(firstLumSrcY, posY);
-            lastPosY = FFMIN(firstLumSrcY + hout_slice->plane[0].available_lines - 1, srcSliceY + srcSliceH - 1);
-        } else {
-            firstPosY = posY;
-            lastPosY = lastLumSrcY;
-        }
-
-        cPosY = hout_slice->plane[1].sliceY + hout_slice->plane[1].sliceH;
-        if (cPosY <= lastChrSrcY && !hasChrHoles) {
-            firstCPosY = FFMAX(firstChrSrcY, cPosY);
-            lastCPosY = FFMIN(firstChrSrcY + hout_slice->plane[1].available_lines - 1, AV_CEIL_RSHIFT(srcSliceY + srcSliceH, c->chrSrcVSubSample) - 1);
-        } else {
-            firstCPosY = cPosY;
-            lastCPosY = lastChrSrcY;
-        }
-
-        ff_rotate_slice(hout_slice, lastPosY, lastCPosY);
-
-        if (posY < lastLumSrcY + 1) {
-            for (i = lumStart; i < lumEnd; ++i)
-                desc[i].process(c, &desc[i], firstPosY, lastPosY - firstPosY + 1);
-        }
-
-        lastInLumBuf = lastLumSrcY;
-
-        if (cPosY < lastChrSrcY + 1) {
-            for (i = chrStart; i < chrEnd; ++i)
-                desc[i].process(c, &desc[i], firstCPosY, lastCPosY - firstCPosY + 1);
-        }
-
-        lastInChrBuf = lastChrSrcY;
-
-        if (!enough_lines)
-            break;  // we can't output a dstY line so let's try with the next slice
-
-#if HAVE_MMX_INLINE
-        ff_updateMMXDitherTables(c, dstY);
-#endif
-        if (should_dither) {
-            c->chrDither8 = ff_dither_8x8_128[chrDstY & 7];
-            c->lumDither8 = ff_dither_8x8_128[dstY    & 7];
-        }
-        if (dstY >= dstH - 2) {
-            /* hmm looks like we can't use MMX here without overwriting
-             * this array's tail */
-            ff_sws_init_output_funcs(c, &yuv2plane1, &yuv2planeX, &yuv2nv12cX,
-                                     &yuv2packed1, &yuv2packed2, &yuv2packedX, &yuv2anyX);
-            use_mmx_vfilter= 0;
-            ff_init_vscale_pfn(c, yuv2plane1, yuv2planeX, yuv2nv12cX,
-                           yuv2packed1, yuv2packed2, yuv2packedX, yuv2anyX, use_mmx_vfilter);
-        }
-
-        {
-            for (i = vStart; i < vEnd; ++i)
-                desc[i].process(c, &desc[i], dstY, 1);
-        }
+        nbthreads = (left_lines + lines_per_thread -1)/lines_per_thread;
+    } else {
+        nbthreads = 0;
     }
+
+    swscale_threads_prepare(c);
+
+    for (int s = 0; s < nbthreads; s++) {
+        int chunk = lines_per_thread;
+        if (chunk > left_lines) {
+            chunk = left_lines;
+            /* Use current thread to calc last part. */
+            last_chunk += left_lines;
+            break;
+        }
+
+        left_lines -= chunk;
+        if (chunk <= 0)
+            break;
+
+        ctx = &c->threads_ctx[s];
+        step = &ctx->func_ctx->step_param;
+
+        step->dstY= dstY + s * lines_per_thread;
+        step->dstHend = dstY + s * lines_per_thread + chunk;
+        step->dstH = dstH;
+        step->srcSliceY = srcSliceY;
+        step->srcSliceH = srcSliceH;
+
+        pthread_mutex_lock(&ctx->process_mutex);
+        ctx->t_work = 1;
+        pthread_cond_signal(&ctx->process_cond);
+        pthread_mutex_unlock(&ctx->process_mutex);
+   }
+
+#endif
+
+   /*
+    * Calculate last /all lines in slice at the end
+    * to actualize original SwsContext structure.
+    */
+    step = &c->step_param;
+    step->dstY= dstH - last_chunk;
+    step->dstHend = dstH;
+    step->dstH = dstH;
+    step->srcSliceY = srcSliceY;
+    step->srcSliceH = srcSliceH;
+    swscale_step(c);
+
+    dstY = c->dstY;
+
+#if HAVE_THREADS
+    swscale_thread_wait_finish(c);
+#endif
+
     if (isPlanar(dstFormat) && isALPHA(dstFormat) && !needAlpha) {
         int length = dstW;
         int height = dstY - lastDstY;
@@ -515,11 +670,6 @@ static int swscale(SwsContext *c, const uint8_t *src[],
         __asm__ volatile ("sfence" ::: "memory");
 #endif
     emms_c();
-
-    /* store changed local vars back in the context */
-    c->dstY         = dstY;
-    c->lastInLumBuf = lastInLumBuf;
-    c->lastInChrBuf = lastInChrBuf;
 
     return dstY - lastDstY;
 }

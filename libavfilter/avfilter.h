@@ -48,6 +48,7 @@
 #include "libavutil/rational.h"
 
 #include "libavfilter/version.h"
+#include "config.h"
 
 /**
  * Return the LIBAVFILTER_VERSION_INT constant.

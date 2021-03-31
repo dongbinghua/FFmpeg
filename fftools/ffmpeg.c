@@ -1144,7 +1144,8 @@ static void do_subtitle_out(OutputFile *of,
 
 static void do_video_out(OutputFile *of,
                          OutputStream *ost,
-                         AVFrame *next_picture)
+                         AVFrame *next_picture,
+                         double sync_ipts)
 {
     int ret, format_video_sync;
     AVPacket *pkt = ost->pkt;
@@ -1153,13 +1154,16 @@ static void do_video_out(OutputFile *of,
     int nb_frames, nb0_frames, i;
     double delta, delta0;
     double duration = 0;
-    double sync_ipts = AV_NOPTS_VALUE;
+    //double sync_ipts = AV_NOPTS_VALUE;
     int frame_size = 0;
     InputStream *ist = NULL;
     AVFilterContext *filter = ost->filter->filter;
 
     init_output_stream_wrapper(ost, next_picture, 1);
-    sync_ipts = adjust_frame_pts_to_encoder_tb(of, ost, next_picture);
+    if(!abr_pipeline) {
+        sync_ipts = AV_NOPTS_VALUE;
+        sync_ipts = adjust_frame_pts_to_encoder_tb(of, ost, next_picture);
+    }
 
     if (ost->source_index >= 0)
         ist = input_streams[ost->source_index];
@@ -1545,7 +1549,7 @@ static int reap_filters(int flush)
                            "Error in av_buffersink_get_frame_flags(): %s\n", av_err2str(ret));
                 } else if (flush && ret == AVERROR_EOF) {
                     if (av_buffersink_get_type(filter) == AVMEDIA_TYPE_VIDEO)
-                        do_video_out(of, ost, NULL);
+                        do_video_out(of, ost, NULL, AV_NOPTS_VALUE);
                 }
                 break;
             }
@@ -1559,7 +1563,7 @@ static int reap_filters(int flush)
                 if (!ost->frame_aspect_ratio.num)
                     enc->sample_aspect_ratio = filtered_frame->sample_aspect_ratio;
 
-                do_video_out(of, ost, filtered_frame);
+                do_video_out(of, ost, filtered_frame, AV_NOPTS_VALUE);
                 break;
             case AVMEDIA_TYPE_AUDIO:
                 if (!(enc->codec->capabilities & AV_CODEC_CAP_PARAM_CHANGE) &&
@@ -1585,16 +1589,19 @@ static int reap_filters(int flush)
 static int pipeline_reap_filters(int flush, InputFilter * ifilter)
 {
     AVFrame *filtered_frame = NULL;
+    OutputStream *ost;
+    OutputFile *of;
+    AVFilterContext *filter;
+    AVCodecContext *enc;
+    int ret = 0;
     int i;
 
     for (i = 0; i < nb_output_streams; i++) {
         if (ifilter == output_streams[i]->filter->graph->inputs[0]) break;
     }
-    OutputStream *ost = output_streams[i];
-    OutputFile    *of = output_files[ost->file_index];
-    AVFilterContext *filter;
-    AVCodecContext *enc = ost->enc_ctx;
-    int ret = 0;
+    ost = output_streams[i];
+    of = output_files[ost->file_index];
+    enc = ost->enc_ctx;
 
     if (!ost->filter || !ost->filter->graph->graph)
         return 0;
@@ -1602,7 +1609,7 @@ static int pipeline_reap_filters(int flush, InputFilter * ifilter)
 
     if (!ost->initialized) {
         char error[1024] = "";
-        ret = init_output_stream(ost, error, sizeof(error));
+        ret = init_output_stream(ost, NULL, error, sizeof(error));
         if (ret < 0) {
             av_log(NULL, AV_LOG_ERROR, "Error initializing output stream %d:%d -- %s\n",
                    ost->file_index, ost->index, error);
@@ -2452,7 +2459,7 @@ static void *filter_pipeline(void *arg)
         if (ret < 0)
             break;
     }
-    return;
+    return NULL;
 }
 #endif
 static int send_frame_to_filters(InputStream *ist, AVFrame *decoded_frame)

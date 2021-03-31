@@ -1145,7 +1145,7 @@ static void do_subtitle_out(OutputFile *of,
 static void do_video_out(OutputFile *of,
                          OutputStream *ost,
                          AVFrame *next_picture,
-                         double sync_ipts)
+                         double sync_ipts_param, int use_syncips)
 {
     int ret, format_video_sync;
     AVPacket *pkt = ost->pkt;
@@ -1154,15 +1154,15 @@ static void do_video_out(OutputFile *of,
     int nb_frames, nb0_frames, i;
     double delta, delta0;
     double duration = 0;
-    //double sync_ipts = AV_NOPTS_VALUE;
+    double sync_ipts = AV_NOPTS_VALUE;
     int frame_size = 0;
     InputStream *ist = NULL;
     AVFilterContext *filter = ost->filter->filter;
 
     init_output_stream_wrapper(ost, next_picture, 1);
-    if(!abr_pipeline) {
-        sync_ipts = AV_NOPTS_VALUE;
-        sync_ipts = adjust_frame_pts_to_encoder_tb(of, ost, next_picture);
+    sync_ipts = adjust_frame_pts_to_encoder_tb(of, ost, next_picture);
+    if(use_syncips) {
+        sync_ipts = sync_ipts_param;
     }
 
     if (ost->source_index >= 0)
@@ -1549,7 +1549,7 @@ static int reap_filters(int flush)
                            "Error in av_buffersink_get_frame_flags(): %s\n", av_err2str(ret));
                 } else if (flush && ret == AVERROR_EOF) {
                     if (av_buffersink_get_type(filter) == AVMEDIA_TYPE_VIDEO)
-                        do_video_out(of, ost, NULL, AV_NOPTS_VALUE);
+                        do_video_out(of, ost, NULL, 0, 0);
                 }
                 break;
             }
@@ -1563,7 +1563,7 @@ static int reap_filters(int flush)
                 if (!ost->frame_aspect_ratio.num)
                     enc->sample_aspect_ratio = filtered_frame->sample_aspect_ratio;
 
-                do_video_out(of, ost, filtered_frame, AV_NOPTS_VALUE);
+                do_video_out(of, ost, filtered_frame, 0, 0);
                 break;
             case AVMEDIA_TYPE_AUDIO:
                 if (!(enc->codec->capabilities & AV_CODEC_CAP_PARAM_CHANGE) &&
@@ -1632,7 +1632,7 @@ static int pipeline_reap_filters(int flush, InputFilter * ifilter)
                        "Error in av_buffersink_get_frame_flags(): %s\n", av_err2str(ret));
             } else if (flush && ret == AVERROR_EOF) {
                 if (av_buffersink_get_type(filter) == AVMEDIA_TYPE_VIDEO)
-                    do_video_out(of, ost, NULL, AV_NOPTS_VALUE);
+                    do_video_out(of, ost, NULL, AV_NOPTS_VALUE, 0);
             }
             break;
         }
@@ -1671,7 +1671,7 @@ static int pipeline_reap_filters(int flush, InputFilter * ifilter)
                         enc->time_base.num, enc->time_base.den);
             }
 
-            do_video_out(of, ost, filtered_frame, float_pts);
+            do_video_out(of, ost, filtered_frame, float_pts, 1);
             break;
         case AVMEDIA_TYPE_AUDIO:
             if (!(enc->codec->capabilities & AV_CODEC_CAP_PARAM_CHANGE) &&

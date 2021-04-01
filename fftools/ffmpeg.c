@@ -1162,7 +1162,7 @@ static void do_video_out(OutputFile *of,
     init_output_stream_wrapper(ost, next_picture, 1);
     sync_ipts = adjust_frame_pts_to_encoder_tb(of, ost, next_picture);
     if(use_syncips) {
-        sync_ipts = sync_ipts_param;
+   //     sync_ipts = sync_ipts_param;
     }
 
     if (ost->source_index >= 0)
@@ -1595,27 +1595,60 @@ static int pipeline_reap_filters(int flush, InputFilter * ifilter)
     AVCodecContext *enc;
     int ret = 0;
     int i;
+    int ff = -1;
 
     for (i = 0; i < nb_output_streams; i++) {
-        if (ifilter == output_streams[i]->filter->graph->inputs[0]) break;
+        if (ifilter == output_streams[i]->filter->graph->inputs[0]) {
+        	ff = i;
+            break;
+        }
     }
-    ost = output_streams[i];
+
+	if(ff < 0) {
+		av_log(NULL, AV_LOG_ERROR, "\nERROR NOT FOUND!!!!\n");
+	}
+
+	av_log(NULL, AV_LOG_ERROR, "FOUND!!! %i\n", ff);
+
+    ost = output_streams[ff];
     of = output_files[ost->file_index];
     enc = ost->enc_ctx;
+
+
+    av_log(NULL, AV_LOG_ERROR, "FOUND!!! %p  init %i\n", ost->pkt, ost->initialized);
+
 
     if (!ost->filter || !ost->filter->graph->graph)
         return 0;
     filter = ost->filter->filter;
 
-    if (!ost->initialized) {
-        char error[1024] = "";
-        ret = init_output_stream(ost, NULL, error, sizeof(error));
-        if (ret < 0) {
-            av_log(NULL, AV_LOG_ERROR, "Error initializing output stream %d:%d -- %s\n",
-                   ost->file_index, ost->index, error);
-            exit_program(1);
-        }
-    }
+//    if (!ost->initialized || ost->pkt == NULL) {
+//        char error[1024] = "";
+//        ret = init_output_stream(ost, NULL, error, sizeof(error));
+//        if (ret < 0) {
+//            av_log(NULL, AV_LOG_ERROR, "Error initializing output stream %d:%d -- %s\n",
+//                   ost->file_index, ost->index, error);
+//            exit_program(1);
+//        }
+//    }
+
+    /*
+		 * Unlike video, with audio the audio frame size matters.
+		 * Currently we are fully reliant on the lavfi filter chain to
+		 * do the buffering deed for us, and thus the frame size parameter
+		 * needs to be set accordingly. Where does one get the required
+		 * frame size? From the initialized AVCodecContext of an audio
+		 * encoder. Thus, if we have gotten to an audio stream, initialize
+		 * the encoder earlier than receiving the first AVFrame.
+		 */
+		if (av_buffersink_get_type(filter) == AVMEDIA_TYPE_AUDIO)
+			init_output_stream_wrapper(ost, NULL, 1);
+
+		if (!ost->pkt && !(ost->pkt = av_packet_alloc())) {
+			return AVERROR(ENOMEM);
+		}
+
+
 
     if (!ost->filtered_frame && !(ost->filtered_frame = av_frame_alloc())) {
         return AVERROR(ENOMEM);

@@ -1144,8 +1144,7 @@ static void do_subtitle_out(OutputFile *of,
 
 static void do_video_out(OutputFile *of,
                          OutputStream *ost,
-                         AVFrame *next_picture,
-                         double sync_ipts_param, int use_syncips)
+                         AVFrame *next_picture)
 {
     int ret, format_video_sync;
     AVPacket *pkt = ost->pkt;
@@ -1161,9 +1160,6 @@ static void do_video_out(OutputFile *of,
 
     init_output_stream_wrapper(ost, next_picture, 1);
     sync_ipts = adjust_frame_pts_to_encoder_tb(of, ost, next_picture);
-    if(use_syncips) {
-   //     sync_ipts = sync_ipts_param;
-    }
 
     if (ost->source_index >= 0)
         ist = input_streams[ost->source_index];
@@ -1549,7 +1545,7 @@ static int reap_filters(int flush)
                            "Error in av_buffersink_get_frame_flags(): %s\n", av_err2str(ret));
                 } else if (flush && ret == AVERROR_EOF) {
                     if (av_buffersink_get_type(filter) == AVMEDIA_TYPE_VIDEO)
-                        do_video_out(of, ost, NULL, 0, 0);
+                        do_video_out(of, ost, NULL);
                 }
                 break;
             }
@@ -1563,7 +1559,7 @@ static int reap_filters(int flush)
                 if (!ost->frame_aspect_ratio.num)
                     enc->sample_aspect_ratio = filtered_frame->sample_aspect_ratio;
 
-                do_video_out(of, ost, filtered_frame, 0, 0);
+                do_video_out(of, ost, filtered_frame);
                 break;
             case AVMEDIA_TYPE_AUDIO:
                 if (!(enc->codec->capabilities & AV_CODEC_CAP_PARAM_CHANGE) &&
@@ -1595,68 +1591,47 @@ static int pipeline_reap_filters(int flush, InputFilter * ifilter)
     AVCodecContext *enc;
     int ret = 0;
     int i;
-    int ff = -1;
 
     for (i = 0; i < nb_output_streams; i++) {
         if (ifilter == output_streams[i]->filter->graph->inputs[0]) {
-        	ff = i;
             break;
         }
     }
 
-	if(ff < 0) {
-		av_log(NULL, AV_LOG_ERROR, "\nERROR NOT FOUND!!!!\n");
-	}
-
-	av_log(NULL, AV_LOG_ERROR, "FOUND!!! %i\n", ff);
-
-    ost = output_streams[ff];
+    if(i >= nb_output_streams) {
+        av_log(NULL, AV_LOG_ERROR, "Not found Input filter\n");
+        exit_program(1);
+    }
+    ost = output_streams[i];
     of = output_files[ost->file_index];
     enc = ost->enc_ctx;
-
-
-    av_log(NULL, AV_LOG_ERROR, "FOUND!!! %p  init %i\n", ost->pkt, ost->initialized);
 
 
     if (!ost->filter || !ost->filter->graph->graph)
         return 0;
     filter = ost->filter->filter;
 
-//    if (!ost->initialized || ost->pkt == NULL) {
-//        char error[1024] = "";
-//        ret = init_output_stream(ost, NULL, error, sizeof(error));
-//        if (ret < 0) {
-//            av_log(NULL, AV_LOG_ERROR, "Error initializing output stream %d:%d -- %s\n",
-//                   ost->file_index, ost->index, error);
-//            exit_program(1);
-//        }
-//    }
-
     /*
-		 * Unlike video, with audio the audio frame size matters.
-		 * Currently we are fully reliant on the lavfi filter chain to
-		 * do the buffering deed for us, and thus the frame size parameter
-		 * needs to be set accordingly. Where does one get the required
-		 * frame size? From the initialized AVCodecContext of an audio
-		 * encoder. Thus, if we have gotten to an audio stream, initialize
-		 * the encoder earlier than receiving the first AVFrame.
-		 */
-		if (av_buffersink_get_type(filter) == AVMEDIA_TYPE_AUDIO)
-			init_output_stream_wrapper(ost, NULL, 1);
+     * Unlike video, with audio the audio frame size matters.
+     * Currently we are fully reliant on the lavfi filter chain to
+     * do the buffering deed for us, and thus the frame size parameter
+     * needs to be set accordingly. Where does one get the required
+     * frame size? From the initialized AVCodecContext of an audio
+     * encoder. Thus, if we have gotten to an audio stream, initialize
+     * the encoder earlier than receiving the first AVFrame.
+     */
+    if (av_buffersink_get_type(filter) == AVMEDIA_TYPE_AUDIO)
+        init_output_stream_wrapper(ost, NULL, 1);
 
-		if (!ost->pkt && !(ost->pkt = av_packet_alloc())) {
-			return AVERROR(ENOMEM);
-		}
-
-
-
+    if (!ost->pkt && !(ost->pkt = av_packet_alloc())) {
+        return AVERROR(ENOMEM);
+    }
     if (!ost->filtered_frame && !(ost->filtered_frame = av_frame_alloc())) {
         return AVERROR(ENOMEM);
     }
     filtered_frame = ost->filtered_frame;
 
     while (1) {
-        double float_pts = AV_NOPTS_VALUE; // this is identical to filtered_frame.pts but with higher precision
         ret = av_buffersink_get_frame_flags(filter, filtered_frame,
                                            AV_BUFFERSINK_FLAG_NO_REQUEST);
         if (ret < 0) {
@@ -1665,7 +1640,7 @@ static int pipeline_reap_filters(int flush, InputFilter * ifilter)
                        "Error in av_buffersink_get_frame_flags(): %s\n", av_err2str(ret));
             } else if (flush && ret == AVERROR_EOF) {
                 if (av_buffersink_get_type(filter) == AVMEDIA_TYPE_VIDEO)
-                    do_video_out(of, ost, NULL, AV_NOPTS_VALUE, 0);
+                    do_video_out(of, ost, NULL);
             }
             break;
         }
@@ -1673,38 +1648,13 @@ static int pipeline_reap_filters(int flush, InputFilter * ifilter)
             av_frame_unref(filtered_frame);
             continue;
         }
-        if (filtered_frame->pts != AV_NOPTS_VALUE) {
-            int64_t start_time = (of->start_time == AV_NOPTS_VALUE) ? 0 : of->start_time;
-            AVRational filter_tb = av_buffersink_get_time_base(filter);
-            AVRational tb = enc->time_base;
-            int extra_bits = av_clip(29 - av_log2(tb.den), 0, 16);
-
-            tb.den <<= extra_bits;
-            float_pts =
-                av_rescale_q(filtered_frame->pts, filter_tb, tb) -
-                av_rescale_q(start_time, AV_TIME_BASE_Q, tb);
-            float_pts /= 1 << extra_bits;
-            // avoid exact midoints to reduce the chance of rounding differences, this can be removed in case the fps code is changed to work with integers
-            float_pts += FFSIGN(float_pts) * 1.0 / (1<<17);
-
-            filtered_frame->pts =
-                av_rescale_q(filtered_frame->pts, filter_tb, enc->time_base) -
-                av_rescale_q(start_time, AV_TIME_BASE_Q, enc->time_base);
-        }
 
         switch (av_buffersink_get_type(filter)) {
         case AVMEDIA_TYPE_VIDEO:
             if (!ost->frame_aspect_ratio.num)
                 enc->sample_aspect_ratio = filtered_frame->sample_aspect_ratio;
 
-            if (debug_ts) {
-                av_log(NULL, AV_LOG_INFO, "filter -> pts:%s pts_time:%s exact:%f time_base:%d/%d\n",
-                        av_ts2str(filtered_frame->pts), av_ts2timestr(filtered_frame->pts, &enc->time_base),
-                        float_pts,
-                        enc->time_base.num, enc->time_base.den);
-            }
-
-            do_video_out(of, ost, filtered_frame, float_pts, 1);
+            do_video_out(of, ost, filtered_frame);
             break;
         case AVMEDIA_TYPE_AUDIO:
             if (!(enc->codec->capabilities & AV_CODEC_CAP_PARAM_CHANGE) &&

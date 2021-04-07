@@ -261,6 +261,7 @@ typedef struct InputFilter {
     // for abr pipeline
     AVFrame *waited_frm;
     AVFrame input_frm;
+    int thread_status;
     pthread_t f_thread;
     pthread_cond_t process_cond;
     pthread_cond_t finish_cond;

@@ -2486,7 +2486,7 @@ static int send_frame_to_filters(InputStream *ist, AVFrame *decoded_frame)
             } else
                 f = decoded_frame;
 
-            if(ist->filters[i]->f_thread == 0) {
+            if(ist->filters[i]->thread_status == 0) {
                 pthread_mutex_init(&ist->filters[i]->process_mutex, NULL);
                 pthread_mutex_init(&ist->filters[i]->finish_mutex, NULL);
                 pthread_cond_init(&ist->filters[i]->process_cond, NULL);
@@ -2498,6 +2498,7 @@ static int send_frame_to_filters(InputStream *ist, AVFrame *decoded_frame)
                     av_log(NULL, AV_LOG_ERROR, "pthread_create failed: %s. Try to increase `ulimit -v` or decrease `ulimit -s`.\n", strerror(ret));
                     return AVERROR(ret);
                 }
+                ist->filters[i]->thread_status = 1;
             }
 
             pthread_mutex_lock(&ist->filters[i]->process_mutex);

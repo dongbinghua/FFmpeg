@@ -33,6 +33,7 @@
 #include "libavutil/pixfmt.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/ppc/util_altivec.h"
+#include "libavutil/thread.h"
 
 #define STR(s) AV_TOSTRING(s) // AV_STRINGIFY is too long
 
@@ -662,7 +663,7 @@ typedef struct SwsContext {
 struct SwsContextThread {
     void (*func_pfn)(SwsContext *c);
     SwsContext *func_ctx;
-
+    int status;
     pthread_t f_thread;
     pthread_cond_t process_cond;
     pthread_cond_t finish_cond;

@@ -207,7 +207,7 @@ int init_simple_filtergraph(InputStream *ist, OutputStream *ost)
 
     if (abr_pipeline) {
         for (i = 0; i < ist->nb_filters; i++) {
-            ist->filters[i]->f_thread = 0;
+            ist->filters[i]->thread_status = 0;
         }
     }
     GROW_ARRAY(filtergraphs, nb_filtergraphs);

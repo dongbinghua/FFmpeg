@@ -22,7 +22,6 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
-#include <pthread.h>
 
 #include "libavutil/avassert.h"
 #include "libavutil/avutil.h"
